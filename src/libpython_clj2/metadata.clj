@@ -18,6 +18,7 @@
 
 
 (def builtins (import-module "builtins"))
+(def py-str (get-attr builtins "str"))
 (def inspect (import-module "inspect"))
 (def argspec (get-attr inspect "getfullargspec"))
 (def py-source (get-attr inspect "getsource"))
@@ -68,6 +69,39 @@
     (catch Exception _
       nil)))
 
+(def ^:private default-repr-max-len 200)
+
+(defn- safe-py-str [x]
+  (let [s (try (str (py-str x))
+               (catch Throwable _ "<unprintable>"))]
+    (if (> (count s) default-repr-max-len)
+      (str (subs s 0 default-repr-max-len) "...")
+      s)))
+
+(defn- opaque? [v]
+  (and (map? v) (contains? v :type) (contains? v :value)))
+
+(defn- py-default->jvm [x]
+  (let [jvm-val (->jvm x)]
+    ;; nested opaques have no JVM form and leak pointers - stringify instead
+    (if (some opaque? (tree-seq coll? seq jvm-val))
+      (safe-py-str x)
+      jvm-val)))
+
+(defn- py-defaults->jvm [defaults]
+  (when (->jvm defaults)
+    (->> defaults
+         (map py-default->jvm)
+         (into []))))
+
+(defn- py-kwonlydefaults->jvm [kwonlydefaults]
+  (when (->jvm kwonlydefaults)
+    (->> (call-attr kwonlydefaults "items")
+         (map (fn [entry]
+                (let [[k v] (seq entry)]
+                  [(->jvm k) (py-default->jvm v)])))
+         (into {}))))
+
 (defn py-fn-argspec [f]
   (if-let [spec (try (when-not (pyclass? f)
                        (argspec f))
@@ -75,9 +109,9 @@
     {:args           (->jvm (get-attr spec "args"))
      :varargs        (->jvm (get-attr spec "varargs"))
      :varkw          (->jvm (get-attr spec "varkw"))
-     :defaults       (->jvm (get-attr spec "defaults"))
+     :defaults       (py-defaults->jvm (get-attr spec "defaults"))
      :kwonlyargs     (->jvm (get-attr spec "kwonlyargs"))
-     :kwonlydefaults (->jvm (get-attr spec "kwonlydefaults"))
+     :kwonlydefaults (py-kwonlydefaults->jvm (get-attr spec "kwonlydefaults"))
      :annotations    (->jvm (get-attr spec "annotations"))}
     (py-fn-argspec (get-attr f "__init__"))))
 
@@ -132,14 +166,8 @@
                               (map symbol)
                               (into []))
 
-         ;;These sometimes have actual python symbols in them so we can't use them
-         ;; or-map          (->> (concat
-         ;;                       (interleave kw-default-args defaults)
-         ;;                       (flatten (seq kwonlydefaults)))
-         ;;                      (partition-all 2)
-         ;;                      (map vec)
-         ;;                      (map (fn [[k v]] [(symbol k) v]))
-         ;;                      (into {}))
+         ;; Preserve the default values that inspect returned.  These may be nil
+         ;; or non-keyword JVM representations of Python values.
          as-varkw    (when (not (nil? varkw))
                        {:as (symbol varkw)})
          default-map (->> (concat
@@ -147,7 +175,7 @@
                            (flatten (seq kwonlydefaults)))
                           (partition-all 2)
                           (map vec)
-                          (map (fn [[k v]] [(symbol k) (keyword k)]))
+                          (map (fn [[k v]] [(symbol k) v]))
                           (into {}))
 
          kwargs-map (merge default-map
